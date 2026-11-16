@@ -304,7 +304,11 @@ class DataStore {
         : 'ssr';
     this.loadFromLocalStorage();
     if (typeof window !== 'undefined') {
-      this.initRealtimeSync();
+      // start sync only when authenticated; App triggers after login
+      if (this.getAuthHeaders().Authorization) {
+        this.initRealtimeSync();
+      }
+      window.addEventListener('klinik:auth-ready', () => this.initRealtimeSync());
     }
   }
 
@@ -330,10 +334,21 @@ class DataStore {
     });
   }
 
+  private getAuthHeaders(): Record<string,string> {
+    try {
+      const raw = localStorage.getItem('klinik_dompu_auth_session_v2') || sessionStorage.getItem('klinik_dompu_auth_session_v2');
+      if (!raw) return {};
+      const s = JSON.parse(raw);
+      if (s?.token) return { Authorization: 'Bearer ' + s.token };
+    } catch {}
+    return {};
+  }
+
   private apiFetch(url: string, options: RequestInit = {}) {
     const headers: Record<string, string> = {
       ...(options.headers as Record<string, string> | undefined),
       'X-Client-Id': this.clientId,
+      ...this.getAuthHeaders(),
     };
     if (options.body && !headers['Content-Type']) {
       headers['Content-Type'] = 'application/json';
@@ -351,8 +366,10 @@ class DataStore {
         try {
           const parsed = await res.clone().json();
           if (parsed?.error) errText = parsed.error;
-        } catch {
-          // ignore non-json error body
+        } catch {}
+        if (res.status === 401 || res.status === 403) {
+          try { window.dispatchEvent(new CustomEvent('klinik:auth-error', { detail: { status: res.status, error: errText } })); } catch {}
+          throw err;
         }
         const err = new Error(errText);
         if (res.status >= 500 && attempt < 2) {
@@ -450,7 +467,7 @@ class DataStore {
       return;
     }
     try {
-      const res = await fetch('/api/sync/version', { cache: 'no-store' });
+      const res = await fetch('/api/sync/version', { cache: 'no-store', headers: this.getAuthHeaders() });
       if (!res.ok) return;
       const data = await res.json();
       if (typeof data?.version === 'number' && data.version !== this.lastKnownServerVersion) {
@@ -462,6 +479,8 @@ class DataStore {
   }
 
   private initRealtimeSync() {
+    if ((this as any)._realtimeStarted) return;
+    (this as any)._realtimeStarted = true;
     // Initial pull from Cloud SQL
     void this.syncFromDatabase();
 
@@ -471,7 +490,10 @@ class DataStore {
         this.eventSource.close();
       }
       try {
-        const es = new EventSource('/api/events');
+        const ah = this.getAuthHeaders();
+        const tok = (ah.Authorization || '').replace(/^Bearer\s+/i, '');
+        const esUrl = tok ? '/api/events?token=' + encodeURIComponent(tok) : '/api/events';
+        const es = new EventSource(esUrl);
         this.eventSource = es;
 
         es.onmessage = (event) => {
@@ -598,7 +620,7 @@ class DataStore {
 
     this.syncInFlight = (async () => {
       try {
-        const res = await fetch('/api/sync/state', { cache: 'no-store' });
+        const res = await fetch('/api/sync/state', { cache: 'no-store', headers: this.getAuthHeaders() });
         if (!res.ok) return false;
         const snapshot = await res.json();
 
@@ -1312,54 +1334,38 @@ class DataStore {
     );
   }
 
-  public async clearAllKunjungan(): Promise<void> {
+  public async clearAllKunjungan(confirmPhrase = 'HAPUS SEMUA KUNJUNGAN'): Promise<void> {
+    if (typeof window !== 'undefined') {
+      await this.enqueueBatchWrite(async () => {
+        await this.apiFetchChecked('/api/kunjungan/all', { method: 'DELETE', body: JSON.stringify({ confirm: confirmPhrase }) });
+      });
+    }
     this.kunjunganList = [];
     this.resepObatList = [];
     this.saveToLocalStorage();
     this.notifyListeners();
-    if (typeof window !== 'undefined') {
-      await this.enqueueBatchWrite(async () => {
-        await this.apiFetchChecked('/api/kunjungan/all', { method: 'DELETE' });
-      });
-    }
-    this.logAudit('Hapus Semua Kunjungan', 'Mengosongkan seluruh data kunjungan berobat');
   }
 
-  public async clearAllWbp(): Promise<void> {
+  public async clearAllWbp(confirmPhrase = 'HAPUS SEMUA WBP'): Promise<void> {
+    if (typeof window !== 'undefined') {
+      await this.enqueueBatchWrite(async () => {
+        await this.apiFetchChecked('/api/wbp/all', { method: 'DELETE', body: JSON.stringify({ confirm: confirmPhrase }) });
+      });
+    }
     this.wbpList = [];
     this.kunjunganList = [];
     this.resepObatList = [];
     this.saveToLocalStorage();
     this.notifyListeners();
-    if (typeof window !== 'undefined') {
-      await this.enqueueBatchWrite(async () => {
-        await this.apiFetchChecked('/api/wbp/all', { method: 'DELETE' });
-      });
-    }
-    this.logAudit('Hapus Semua WBP', 'Mengosongkan seluruh direktori WBP dan data kunjungan terkait');
   }
 
-  public async resetAllData(): Promise<void> {
-    this.wbpList = INITIAL_WBP;
-    this.kunjunganList = INITIAL_KUNJUNGAN.map((k) => ({
-      ...k,
-      tanggal: normalizeDateIndo(k.tanggal),
-    }));
-    this.referensiList = INITIAL_REFERENSI;
-    this.penyakitList = INITIAL_PENYAKIT;
-    this.pengaturan = INITIAL_PENGATURAN;
-    this.sidbHistory = [];
-    this.auditLogs = [];
-    this.masterObatList = INITIAL_MASTER_OBAT;
-    this.resepObatList = [];
-    this.saveToLocalStorage();
-    this.notifyListeners();
+  public async resetAllData(confirmPhrase = 'RESET PABRIK'): Promise<void> {
     if (typeof window !== 'undefined') {
       await this.enqueueBatchWrite(async () => {
-        await this.apiFetchChecked('/api/system/factory-reset', { method: 'POST' });
+        await this.apiFetchChecked('/api/system/factory-reset', { method: 'POST', body: JSON.stringify({ confirm: confirmPhrase }) });
       });
     }
-    this.logAudit('Reset Data Pabrik', 'Mengembalikan seluruh data ke konfigurasi awal bawaan');
+    await this.syncFromDatabase();
   }
 
   // Referensi & Penyakit Methods
@@ -1642,11 +1648,13 @@ class DataStore {
   }
 
   public updatePengaturan(updates: Partial<PengaturanApp>): Promise<boolean> {
-    this.pengaturan = { ...this.pengaturan, ...updates };
+    const safe: any = { ...updates };
+    delete safe.password_hash;
+    this.pengaturan = { ...this.pengaturan, ...safe };
     this.saveToLocalStorage();
     this.notifyListeners();
 
-    const snapshot = { ...this.pengaturan };
+    const snapshot = { ...this.pengaturan, password_hash: '' };
     this.logAudit('Ubah Pengaturan', 'Memperbarui konfigurasi sistem');
 
     if (typeof window !== 'undefined') {
@@ -1738,7 +1746,7 @@ class DataStore {
   public async exportFullBackupAsync(): Promise<string> {
     const prefs = this.readLocalPreferences();
     try {
-      const res = await fetch('/api/backup/export', { cache: 'no-store' });
+      const res = await fetch('/api/backup/export', { cache: 'no-store', headers: this.getAuthHeaders() });
       if (res.ok) {
         const serverBackup = await res.json();
         serverBackup.preferences = prefs;
@@ -1810,7 +1818,7 @@ class DataStore {
         await this.enqueueBatchWrite(async () => {
           await this.apiFetchChecked('/api/backup/restore', {
             method: 'POST',
-            body: JSON.stringify(payload),
+            body: JSON.stringify({ confirm: 'PULIHKAN CADANGAN', backup: payload }),
           });
         });
       }

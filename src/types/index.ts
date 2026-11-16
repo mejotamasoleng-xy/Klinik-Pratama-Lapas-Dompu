@@ -116,7 +116,7 @@ export interface PengaturanApp {
   batas_sering_berobat_kali: number;
   periode_sering_hari: number;
   batches: BatchConfig[];
-  password_hash: string;
+  password_hash?: string;
   supabase_url?: string;
   supabase_anon_key?: string;
   nama_klinik: string;

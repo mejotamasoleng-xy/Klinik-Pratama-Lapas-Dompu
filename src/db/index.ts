@@ -67,11 +67,15 @@ if (hasSqlConfig) {
       dbInstance = drizzle(pool, { schema });
     }
   } catch (err) {
-    console.warn('[AI Studio] Database initialization failed — using in-memory mock:', err);
+    console.warn('[DB] Database initialization failed:', err);
     dbInstance = null;
   }
 } else {
-  console.warn('[AI Studio] SQL environment variables not configured — using in-memory database mock');
+  if (process.env.NODE_ENV === 'production') {
+    console.error('[DB] SQL environment variables not configured. Production requires a configured database.');
+  } else {
+    console.warn('[DB] SQL environment variables not configured — using in-memory database mock (development only).');
+  }
 }
 
 export const db = dbInstance;

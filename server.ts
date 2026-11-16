@@ -7,7 +7,12 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import * as dotenv from 'dotenv';
-import { checkDatabaseHealth } from './src/db/index.ts';
+import helmet from 'helmet';
+// cors handled inline
+import { z } from 'zod';
+import { checkDatabaseHealth, db } from './src/db/index.ts';
+import { users, rateLimitState } from './src/db/schema.ts';
+import { eq } from 'drizzle-orm';
 import {
   getAllWbp,
   upsertWbpSingle,
@@ -60,7 +65,12 @@ import {
   type MasterObatInsert,
   type ResepObatInsert,
 } from './src/db/queries.ts';
-import { optionalOrRequiredAuth } from './src/middleware/auth.ts';
+import { requireAuth, requireRoles, ensureDestructiveAllowed, rejectIfMustChangePassword, type AuthRequest } from './src/middleware/auth.ts';
+import { getTrustedClientIp, validateBody } from './src/lib/security.ts';
+import { hashPasswordServer } from './src/lib/password.ts';
+import { signSessionToken, verifySessionToken, verifyScryptOrLegacy } from './src/lib/server-auth.ts';
+import { findUserByUsername, findUserByUid, listUsers, createOrUpdateUser, ensureBootstrapAdmin } from './src/lib/user-store.ts';
+import { auditServer } from './src/lib/audit-server.ts';
 import {
   INITIAL_KUNJUNGAN,
   INITIAL_MASTER_OBAT,
@@ -78,10 +88,41 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '50mb' }));
+const isProd = process.env.NODE_ENV === 'production';
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-// Prevent proxies / mobile browsers from caching live API responses
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+}));
+app.use((req, res, next) => {
+  const origin = req.headers.origin as string | undefined;
+  let allow: string | null = null;
+  if (!origin) {
+    // same-origin/non-browser
+  } else if (allowedOrigins.length === 0) {
+    if (!isProd) allow = origin;
+  } else if (allowedOrigins.includes(origin)) {
+    allow = origin;
+  }
+  if (allow) {
+    res.setHeader('Access-Control-Allow-Origin', allow);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Client-Id');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+app.use(express.json({ limit: '1mb' }));
+
 app.use('/api', (req, res, next) => {
   if (req.path !== '/events') {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -90,6 +131,93 @@ app.use('/api', (req, res, next) => {
   }
   next();
 });
+
+const rlMemory = new Map<string, { count: number; windowStart: number }>();
+async function rateLimitDb(key: string, windowMs: number, max: number): Promise<{ allowed: boolean; retryAfter?: number }> {
+  const now = Date.now();
+  if (!db) {
+    const cur = rlMemory.get(key);
+    if (!cur || now - cur.windowStart >= windowMs) {
+      rlMemory.set(key, { count: 1, windowStart: now });
+      return { allowed: true };
+    }
+    cur.count += 1;
+    if (cur.count > max) return { allowed: false, retryAfter: Math.ceil((cur.windowStart + windowMs - now) / 1000) };
+    return { allowed: true };
+  }
+  try {
+    const rows = await db.select().from(rateLimitState).where(eq(rateLimitState.key, key));
+    const cur: any = rows[0];
+    if (!cur || now - Number(cur.windowStart) >= windowMs) {
+      await db.insert(rateLimitState).values({ key, count: 1, windowStart: now, updatedAt: new Date() })
+        .onConflictDoUpdate({ target: rateLimitState.key, set: { count: 1, windowStart: now, updatedAt: new Date() } });
+      return { allowed: true };
+    }
+    const newCount = Number(cur.count) + 1;
+    await db.update(rateLimitState).set({ count: newCount, updatedAt: new Date() }).where(eq(rateLimitState.key, key));
+    if (newCount > max) return { allowed: false, retryAfter: Math.ceil((Number(cur.windowStart) + windowMs - now) / 1000) };
+    return { allowed: true };
+  } catch {
+    const cur = rlMemory.get(key);
+    if (!cur || now - cur.windowStart >= windowMs) { rlMemory.set(key, { count: 1, windowStart: now }); return { allowed: true }; }
+    cur.count += 1;
+    if (cur.count > max) return { allowed: false, retryAfter: Math.ceil((cur.windowStart + windowMs - now) / 1000) };
+    return { allowed: true };
+  }
+}
+
+function makeRateLimiter(windowMs: number, max: number, prefix: string) {
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const ip = getTrustedClientIp(req);
+    const key = `${prefix}:${ip}`;
+    const r = await rateLimitDb(key, windowMs, max);
+    if (!r.allowed) {
+      res.setHeader('Retry-After', String(r.retryAfter || 60));
+      return res.status(429).json({ error: 'Terlalu banyak permintaan. Coba lagi nanti.', retryAfter: r.retryAfter });
+    }
+    next();
+  };
+}
+
+const apiLimiter = makeRateLimiter(60_000, 180, 'api');
+const loginLimiter = makeRateLimiter(60_000, 8, 'login');
+app.use('/api', apiLimiter);
+
+const jsonLarge = express.json({ limit: '50mb' });
+
+function requireConfirm(phrase: string) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const body: any = req.body || {};
+    if (String(body.confirm || '').trim() !== phrase) {
+      return res.status(400).json({ error: `Konfirmasi diperlukan. Ketik "${phrase}" untuk melanjutkan.` });
+    }
+    next();
+  };
+}
+
+function blockInProduction(action: string) {
+  return (_req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (isProd) return res.status(403).json({ error: `${action} dinonaktifkan di lingkungan produksi.` });
+    next();
+  };
+}
+
+const authChain = [requireAuth, rejectIfMustChangePassword] as any[];
+const adminDestructive = [requireAuth, rejectIfMustChangePassword, requireRoles('admin')];
+const readMedical = [requireAuth, rejectIfMustChangePassword, requireRoles('admin', 'dokter_perawat', 'petugas_administrasi')];
+const writeMedical = [requireAuth, rejectIfMustChangePassword, requireRoles('admin', 'dokter_perawat')];
+const writeAdminOrMed = [requireAuth, rejectIfMustChangePassword, requireRoles('admin', 'dokter_perawat', 'petugas_administrasi')];
+
+function parseOr400<T extends z.ZodTypeAny>(schema: T, req: express.Request, res: express.Response): z.infer<T> | null {
+  const p = schema.safeParse(req.body);
+  if (!p.success) { res.status(400).json({ error: 'Data tidak valid.', issues: p.error.issues.slice(0,5) }); return null; }
+  return p.data;
+}
+
+const wbpBodySchema = z.object({}).passthrough();
+const kunjunganBodySchema = z.object({}).passthrough();
+const genericArraySchema = z.array(z.any());
+
 
 // ============================================================================
 // REAL-TIME MULTI-DEVICE BROADCAST (SSE + DB-SHARED VERSION)
@@ -115,7 +243,7 @@ async function broadcastSync(scope: string, sourceClientId?: string) {
   }
 }
 
-app.get('/api/events', (req, res) => {
+app.get('/api/events', ...authChain, (req: any, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -517,9 +645,136 @@ async function buildFullSnapshot() {
 }
 
 // ============================================================================
+// AUTHENTICATION & USER MANAGEMENT (Fase 1)
+// ============================================================================
+
+const loginSchema = z.object({
+  username: z.string().trim().min(1).max(64),
+  password: z.string().min(1).max(200),
+  rememberMe: z.boolean().optional(),
+});
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1).max(200),
+  newPassword: z.string().min(8).max(200),
+});
+const createUserSchema = z.object({
+  username: z.string().trim().min(3).max(64),
+  email: z.string().email().max(200).optional(),
+  displayName: z.string().trim().max(200).optional(),
+  role: z.enum(['admin','dokter_perawat','petugas_administrasi']),
+  password: z.string().min(8).max(200),
+});
+
+app.post('/api/auth/login', loginLimiter, async (req: any, res) => {
+  try {
+    await ensureBootstrapAdmin();
+    const body = parseOr400(loginSchema, req, res);
+    if (!body) return;
+    const username = body.username.trim();
+    const password = body.password;
+    let user = await findUserByUsername(username);
+    if (!user || !user.isActive) {
+      await auditServer(req, 'Login Gagal', `Percobaan login gagal untuk username "${username}"`, username);
+      return res.status(401).json({ error: 'Username atau kata sandi tidak sesuai.' });
+    }
+    const stored = (user as any).passwordHash || '';
+    const vr = verifyScryptOrLegacy(password, stored);
+    if (!vr.ok) {
+      await auditServer({ ...req, authUser: { id: String((user as any).id||user.uid), username: user.username, role: user.role } } as any, 'Login Gagal', 'Kata sandi salah', username);
+      return res.status(401).json({ error: 'Username atau kata sandi tidak sesuai.' });
+    }
+    // upgrade legacy hash
+    if (vr.needsRehash) {
+      try { await createOrUpdateUser({ ...(user as any), passwordHash: hashPasswordServer(password) }); } catch {}
+    }
+    const rememberMe = Boolean(body.rememberMe);
+    const ttl = rememberMe ? 30 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    const payload = {
+      sub: (user as any).uid,
+      uid: (user as any).uid,
+      username: (user as any).username,
+      role: (user as any).role,
+      mustChangePassword: Boolean((user as any).mustChangePassword),
+      exp: Date.now() + ttl,
+    };
+    const token = signSessionToken(payload);
+    await auditServer({ ...req, authUser: { id: String((user as any).id||user.uid), username: user.username, role: user.role } } as any, 'Login Berhasil', 'Petugas masuk ke sistem', username);
+    res.json({
+      token,
+      user: {
+        uid: (user as any).uid,
+        username: (user as any).username,
+        displayName: (user as any).displayName || (user as any).username,
+        role: (user as any).role,
+        mustChangePassword: Boolean((user as any).mustChangePassword),
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Gagal memproses login.' });
+  }
+});
+
+app.get('/api/auth/me', ...authChain, async (req: any, res) => {
+  const u = req.authUser;
+  res.json({ user: u });
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req: any, res) => {
+  try {
+    const body = parseOr400(changePasswordSchema, req, res);
+    if (!body) return;
+    const u = req.authUser;
+    if (!u) return res.status(401).json({ error: 'Tidak terautentikasi.' });
+    const dbUser = await findUserByUsername(u.username) || (u.uid ? await findUserByUid(u.uid) : null);
+    if (!dbUser) return res.status(404).json({ error: 'Pengguna tidak ditemukan.' });
+    const stored = (dbUser as any).passwordHash || '';
+    const vr = verifyScryptOrLegacy(body.currentPassword, stored);
+    if (!vr.ok) return res.status(400).json({ error: 'Kata sandi saat ini tidak sesuai.' });
+    if (body.newPassword.length < 8) return res.status(400).json({ error: 'Kata sandi baru minimal 8 karakter.' });
+    await createOrUpdateUser({ ...(dbUser as any), passwordHash: hashPasswordServer(body.newPassword), mustChangePassword: false });
+    await auditServer(req, 'Ganti Kata Sandi', 'Pengguna mengganti kata sandi sendiri', u.username);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Gagal mengganti kata sandi.' });
+  }
+});
+
+app.get('/api/auth/users', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin')], async (req: any, res) => {
+  try {
+    const usersList = await listUsers();
+    res.json(usersList.map((u: any) => ({
+      uid: u.uid, username: u.username, displayName: u.displayName, role: u.role, email: u.email, mustChangePassword: u.mustChangePassword, isActive: u.isActive,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/users', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin')], async (req: any, res) => {
+  try {
+    const body = parseOr400(createUserSchema, req, res);
+    if (!body) return;
+    const created = await createOrUpdateUser({
+      username: body.username,
+      email: body.email || `${body.username}@local.invalid`,
+      displayName: body.displayName || body.username,
+      role: body.role,
+      passwordHash: hashPasswordServer(body.password),
+      mustChangePassword: true,
+      isActive: true,
+    } as any);
+    await auditServer(req, 'Buat Pengguna', `Admin membuat pengguna ${body.username} (${body.role})`, body.username);
+    res.json({ success: true, user: { uid: (created as any).uid, username: body.username, role: body.role } });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================================
 // HEALTH, VERSION & FULL SNAPSHOT ENDPOINTS
 // ============================================================================
-app.get('/api/health', async (_req, res) => {
+app.get('/api/health', async (_req: any, res) => {
   const dbHealth = await checkDatabaseHealth();
   const version = await getSharedSyncVersion();
   res.status(dbHealth.mode === 'cloudsql' && !dbHealth.connected ? 503 : 200).json({
@@ -532,7 +787,7 @@ app.get('/api/health', async (_req, res) => {
   });
 });
 
-app.get('/api/sync/version', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sync/version', ...authChain, async (_req: any, res) => {
   try {
     const version = await getSharedSyncVersion();
     syncVersion = version;
@@ -542,18 +797,23 @@ app.get('/api/sync/version', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.get('/api/sync/state', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sync/state', ...authChain, async (req: any, res) => {
   try {
     const snapshot = await buildFullSnapshot();
+    if (req.authUser?.role !== 'admin') {
+      snapshot.audit_logs = [];
+    }
+    await auditServer(req, 'Baca Data', 'Membaca snapshot data sinkronisasi (termasuk rekam medis)', 'sync/state');
     res.json(snapshot);
   } catch (error: any) {
     res.status(503).json({ error: error.message });
   }
 });
 
-app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/backup/export', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const snapshot = await buildFullSnapshot();
+    await auditServer(req, 'Ekspor Data', 'Mengekspor cadangan data (termasuk rekam medis)', 'backup/export');
     res.json({
       version: '2.0',
       app_name: 'Klinik Pratama Lapas Kelas IIB Dompu',
@@ -585,13 +845,15 @@ app.get('/api/backup/export', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/backup/restore', jsonLarge, ...adminDestructive, requireConfirm('PULIHKAN CADANGAN'), async (req: any, res) => {
   try {
-    const data = req.body;
+    const raw = req.body || {};
+    const data = raw.backup && typeof raw.backup === 'object' ? raw.backup : raw;
     const clientId = req.headers['x-client-id'] as string | undefined;
     if (!data || typeof data !== 'object') {
       return res.status(400).json({ error: 'Format cadangan tidak valid' });
     }
+    await auditServer(req, 'Pulihkan Cadangan', 'Memulihkan data dari cadangan (overwrite)', 'backup/restore');
 
     const wbpRows: WbpInsert[] = Array.isArray(data.wbp) ? data.wbp.map(mapWbpFromClient) : [];
     const wbpIdSet = new Set(wbpRows.map((w) => w.id));
@@ -654,9 +916,10 @@ app.post('/api/backup/restore', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/system/factory-reset', ...adminDestructive, blockInProduction('Factory reset'), requireConfirm('RESET PABRIK'), async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
+    await auditServer(req, 'Reset Pabrik', 'Melakukan reset sistem ke data awal (factory reset)', 'system/factory-reset');
     await restoreAllTables({
       wbp: INITIAL_WBP.map(mapWbpFromClient),
       kunjungan: INITIAL_KUNJUNGAN.map(mapKunjunganFromClient),
@@ -678,19 +941,21 @@ app.post('/api/system/factory-reset', optionalOrRequiredAuth, async (req, res) =
 // ============================================================================
 // WBP ENDPOINTS
 // ============================================================================
-app.get('/api/wbp', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/wbp', ...authChain, async (req: any, res) => {
   try {
     const list = await getAllWbp();
+    await auditServer(req, 'Baca Data', 'Membaca daftar data WBP', 'wbp');
     res.json(list.map(mapWbpToClient));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/wbp', ...writeAdminOrMed, async (req: any, res) => {
   try {
+    const body = parseOr400(wbpBodySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const saved = await upsertWbpSingle(mapWbpFromClient(req.body));
+    const saved = await upsertWbpSingle(mapWbpFromClient(body));
     await broadcastSync('wbp', clientId);
     res.json(mapWbpToClient(saved, 0));
   } catch (error: any) {
@@ -698,10 +963,11 @@ app.post('/api/wbp', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/wbp/:id', ...writeAdminOrMed, async (req: any, res) => {
   try {
+    const body = parseOr400(wbpBodySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const saved = await upsertWbpSingle(mapWbpFromClient({ ...req.body, id: req.params.id }));
+    const saved = await upsertWbpSingle(mapWbpFromClient({ ...body, id: req.params.id }));
     await broadcastSync('wbp', clientId);
     res.json(mapWbpToClient(saved, 0));
   } catch (error: any) {
@@ -709,10 +975,11 @@ app.put('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/wbp/all', ...adminDestructive, requireConfirm('HAPUS SEMUA WBP'), async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await clearAllWbpFromDb();
+    await auditServer(req, 'Hapus Semua WBP', `Menghapus seluruh data WBP (${result.length} data)`, 'wbp/all', { count: result.length });
     await broadcastSync('wbp', clientId);
     res.json({ message: 'All WBP deleted', count: result.length });
   } catch (error: any) {
@@ -720,7 +987,7 @@ app.delete('/api/wbp/all', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/wbp/:id', ...writeAdminOrMed, async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteWbpById(req.params.id);
@@ -731,10 +998,11 @@ app.delete('/api/wbp/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/wbp/batch', ...writeAdminOrMed, async (req: any, res) => {
   try {
+    const body = parseOr400(genericArraySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const items = Array.isArray(req.body) ? req.body.map(mapWbpFromClient) : [];
+    const items = Array.isArray(body) ? body.map(mapWbpFromClient) : [];
     const result = await upsertWbpBatch(items);
     await broadcastSync('wbp', clientId);
     res.json(result.map(mapWbpToClient));
@@ -746,19 +1014,21 @@ app.post('/api/wbp/batch', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // KUNJUNGAN ENDPOINTS
 // ============================================================================
-app.get('/api/kunjungan', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/kunjungan', ...authChain, async (req: any, res) => {
   try {
     const list = await getAllKunjungan();
+    await auditServer(req, 'Baca Data', 'Membaca daftar rekam medis/kunjungan', 'kunjungan');
     res.json(list.map(mapKunjunganToClient));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/kunjungan', ...writeMedical, async (req: any, res) => {
   try {
+    const body = parseOr400(kunjunganBodySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const payload = mapKunjunganFromClient(req.body);
+    const payload = mapKunjunganFromClient(body);
     if (payload.wbpId === '') payload.wbpId = null;
     const result = await insertKunjungan(payload);
     await broadcastSync('kunjungan', clientId);
@@ -768,10 +1038,11 @@ app.post('/api/kunjungan', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/kunjungan/:id', ...writeMedical, async (req: any, res) => {
   try {
+    const body = parseOr400(kunjunganBodySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const payload = mapKunjunganFromClient({ ...req.body, id: req.params.id });
+    const payload = mapKunjunganFromClient({ ...body, id: req.params.id });
     if (payload.wbpId === '') payload.wbpId = null;
     const result = await updateKunjunganById(req.params.id, {
       ...payload,
@@ -784,11 +1055,12 @@ app.put('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/kunjungan/batch', ...writeMedical, async (req: any, res) => {
   try {
+    const body = parseOr400(genericArraySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const items = Array.isArray(req.body)
-      ? req.body.map((k) => {
+    const items = Array.isArray(body)
+      ? body.map((k: any) => {
           const mapped = mapKunjunganFromClient(k);
           if (mapped.wbpId === '') mapped.wbpId = null;
           return mapped;
@@ -802,10 +1074,11 @@ app.post('/api/kunjungan/batch', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/all', ...adminDestructive, requireConfirm('HAPUS SEMUA KUNJUNGAN'), async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await clearAllKunjunganFromDb();
+    await auditServer(req, 'Hapus Semua Kunjungan', `Menghapus seluruh data kunjungan (${result.length} data)`, 'kunjungan/all', { count: result.length });
     await broadcastSync('kunjungan', clientId);
     res.json({ message: 'All visits deleted', count: result.length });
   } catch (error: any) {
@@ -813,7 +1086,7 @@ app.delete('/api/kunjungan/all', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res) => {
+app.patch('/api/kunjungan/:id/restore', ...writeMedical, async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await restoreKunjunganById(req.params.id);
@@ -824,7 +1097,7 @@ app.patch('/api/kunjungan/:id/restore', optionalOrRequiredAuth, async (req, res)
   }
 });
 
-app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/:id/permanent', ...adminDestructive, async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await deleteResepByKunjunganId(req.params.id);
@@ -836,7 +1109,7 @@ app.delete('/api/kunjungan/:id/permanent', optionalOrRequiredAuth, async (req, r
   }
 });
 
-app.delete('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/kunjungan/:id', ...writeMedical, async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     await deleteResepByKunjunganId(req.params.id);
@@ -851,7 +1124,7 @@ app.delete('/api/kunjungan/:id', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // PENYAKIT & REFERENSI ICD-10 ENDPOINTS
 // ============================================================================
-app.get('/api/penyakit', async (_req, res) => {
+app.get('/api/penyakit', ...authChain, async (_req: any, res) => {
   try {
     const list = await getAllPenyakit();
     res.json(list.map(mapPenyakitToClient));
@@ -860,7 +1133,7 @@ app.get('/api/penyakit', async (_req, res) => {
   }
 });
 
-app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/penyakit', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertPenyakit(mapPenyakitFromClient(req.body, 0));
@@ -871,7 +1144,7 @@ app.post('/api/penyakit', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/penyakit/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/penyakit/:id', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertPenyakit(mapPenyakitFromClient({ ...req.body, id: req.params.id }, 0));
@@ -885,7 +1158,7 @@ app.put('/api/penyakit/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/penyakit/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/penyakit/batch', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const bodyItems = Array.isArray(req.body) ? req.body : Array.isArray(req.body?.items) ? req.body.items : [];
@@ -899,7 +1172,7 @@ app.post('/api/penyakit/batch', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/referensi', async (_req, res) => {
+app.get('/api/referensi', ...authChain, async (_req: any, res) => {
   try {
     const list = await getAllReferensi();
     res.json(list.map(mapReferensiToClient));
@@ -908,7 +1181,7 @@ app.get('/api/referensi', async (_req, res) => {
   }
 });
 
-app.post('/api/referensi/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/referensi/batch', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const bodyItems = Array.isArray(req.body) ? req.body : Array.isArray(req.body?.items) ? req.body.items : [];
@@ -922,7 +1195,7 @@ app.post('/api/referensi/batch', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/referensi', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertReferensi(mapReferensiFromClient(req.body));
@@ -933,7 +1206,7 @@ app.post('/api/referensi', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/referensi/:id', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertReferensi(mapReferensiFromClient({ ...req.body, id: req.params.id }));
@@ -944,7 +1217,7 @@ app.put('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/referensi/:id', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteReferensiById(req.params.id);
@@ -958,7 +1231,7 @@ app.delete('/api/referensi/:id', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // PENGATURAN, SIDB HISTORY & AUDIT LOG ENDPOINTS
 // ============================================================================
-app.get('/api/pengaturan/:key', async (req, res) => {
+app.get('/api/pengaturan/:key', ...authChain, async (req: any, res) => {
   try {
     const value = await getSetting(req.params.key);
     res.json(value);
@@ -967,10 +1240,14 @@ app.get('/api/pengaturan/:key', async (req, res) => {
   }
 });
 
-app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/pengaturan/:key', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const result = await setSetting(req.params.key, req.body);
+    let value = req.body;
+    if (req.params.key === 'app_settings' && value && typeof value === 'object') {
+      value = { ...value, password_hash: '' };
+    }
+    const result = await setSetting(req.params.key, value);
     await broadcastSync('pengaturan', clientId);
     res.json(result);
   } catch (error: any) {
@@ -978,7 +1255,7 @@ app.post('/api/pengaturan/:key', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/sidb-history', ...authChain, async (_req: any, res) => {
   try {
     const list = await getSidbHistoryList();
     res.json(list.map(mapSidbToClient));
@@ -987,7 +1264,7 @@ app.get('/api/sidb-history', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/sidb-history', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await addSidbHistoryEntry(mapSidbFromClient(req.body));
@@ -998,7 +1275,7 @@ app.post('/api/sidb-history', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/audit', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin')], async (req: any, res) => {
   try {
     const list = await getAuditLogs(500);
     res.json(list.map(mapAuditToClient));
@@ -1007,10 +1284,24 @@ app.get('/api/audit', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/audit', ...authChain, async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const result = await addAuditLog(req.body);
+    const body = req.body || {};
+    const entry = {
+      id: String(body.id || ('log-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8))),
+      waktu: String(body.waktu || new Date().toISOString()),
+      aksi: String(body.aksi || 'Log'),
+      rincian: String(body.rincian || ''),
+      perangkat: String(body.perangkat || req.headers['user-agent'] || ''),
+      userId: req.authUser ? String(req.authUser.id) : null,
+      username: req.authUser?.username || null,
+      role: req.authUser?.role || null,
+      ipAddress: req.clientIp || null,
+      target: body.target || null,
+      metadata: body.metadata || null,
+    };
+    const result = await addAuditLog(entry as any);
     await broadcastSync('audit', clientId);
     res.json(result);
   } catch (error: any) {
@@ -1021,7 +1312,7 @@ app.post('/api/audit', optionalOrRequiredAuth, async (req, res) => {
 // ============================================================================
 // MASTER OBAT & RESEP OBAT ENDPOINTS
 // ============================================================================
-app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/obat', ...authChain, async (_req: any, res) => {
   try {
     const list = await getAllMasterObat();
     res.json(list.map(mapMasterObatToClient));
@@ -1030,7 +1321,7 @@ app.get('/api/obat', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.post('/api/obat/batch', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/obat/batch', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const bodyItems = Array.isArray(req.body) ? req.body : Array.isArray(req.body?.items) ? req.body.items : [];
@@ -1044,7 +1335,7 @@ app.post('/api/obat/batch', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
+app.post('/api/obat', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const saved = await upsertMasterObat(mapMasterObatFromClient(req.body));
@@ -1055,7 +1346,7 @@ app.post('/api/obat', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
+app.delete('/api/obat/:id', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const result = await deleteMasterObatById(req.params.id);
@@ -1066,7 +1357,7 @@ app.delete('/api/obat/:id', optionalOrRequiredAuth, async (req, res) => {
   }
 });
 
-app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
+app.get('/api/resep', ...authChain, async (_req: any, res) => {
   try {
     const list = await getAllResepObat();
     res.json(list.map(mapResepObatToClient));
@@ -1075,7 +1366,7 @@ app.get('/api/resep', optionalOrRequiredAuth, async (_req, res) => {
   }
 });
 
-app.put('/api/resep/kunjungan/:kunjunganId', optionalOrRequiredAuth, async (req, res) => {
+app.put('/api/resep/kunjungan/:kunjunganId', ...[requireAuth, rejectIfMustChangePassword, requireRoles('admin','dokter_perawat')], async (req: any, res) => {
   try {
     const clientId = req.headers['x-client-id'] as string | undefined;
     const items = Array.isArray(req.body)
@@ -1094,11 +1385,20 @@ app.use('/api/*', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found' });
 });
 
+function enforceProductionDatabaseOrExit() {
+  if (isProd && !db) {
+    // eslint-disable-next-line no-console
+    console.error('[FATAL] Database tidak terkonfigurasi/terhubung. Server produksi menolak start tanpa database.');
+    process.exit(1);
+  }
+}
+
 // Setup Vite middlewares for Frontend SPA
 async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+  enforceProductionDatabaseOrExit();
+  const isProdEnv = process.env.NODE_ENV === 'production';
 
-  if (!isProd) {
+  if (!isProdEnv) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },

@@ -19,14 +19,16 @@ import {
   AlertCircle,
   Plus,
 } from 'lucide-react';
-import { formatDateTimeWita, hashPassword, store, useStoreSync } from '../lib/storage';
+import { formatDateTimeWita, store, useStoreSync } from '../lib/storage';
 import { BatchConfig } from '../types';
 import ReferencesManager from './ReferencesManager';
 import SidbUpdater from './SidbUpdater';
 import DataImporter from './DataImporter';
+import { getCurrentSession, changeMyPassword, getCurrentApiToken } from '../lib/auth';
 
 export type SettingsSubTab =
   | 'keamanan'
+  | 'pengguna'
   | 'referensi'
   | 'update_sidb'
   | 'impor_ekspor'
@@ -36,15 +38,33 @@ export type SettingsSubTab =
   | 'sampah'
   | 'hapus_semua';
 
+type ManagedUser = {
+  uid: string;
+  username: string;
+  displayName?: string;
+  role: string;
+  email?: string;
+  mustChangePassword?: boolean;
+  isActive?: boolean;
+};
+
 export default function SettingsModal() {
   const storeVersion = useStoreSync();
   const [activeTab, setActiveTab] = useState<SettingsSubTab>('keamanan');
+
+  const session = getCurrentSession();
+  const isAdmin = session?.role === 'admin';
 
   // Keamanan: Ganti Password
   const [currentPass, setCurrentPass] = useState('');
   const [newPass, setNewPass] = useState('');
   const [confirmPass, setConfirmPass] = useState('');
   const [passMsg, setPassMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // User management (admin)
+  const [usersList, setUsersList] = useState<ManagedUser[]>([]);
+  const [userMsg, setUserMsg] = useState<string | null>(null);
+  const [newUser, setNewUser] = useState({ username: '', displayName: '', email: '', role: 'petugas_administrasi', password: '' });
 
   // Sering Berobat
   const pengaturan = store.getPengaturan();
@@ -69,41 +89,58 @@ export default function SettingsModal() {
   const deletedVisits = store.getCalculatedKunjungan(true).filter((k) => k.dihapus);
   const auditLogs = store.getAuditLogs();
 
-  // Handle Change Password
+  const loadUsers = async () => {
+    if (!isAdmin) return;
+    try {
+      const token = getCurrentApiToken();
+      const res = await fetch('/api/auth/users', { headers: { Authorization: 'Bearer ' + token } });
+      if (res.ok) setUsersList(await res.json());
+    } catch {}
+  };
+
+  useEffect(() => { if (activeTab === 'pengguna') void loadUsers(); }, [activeTab, isAdmin]);
+
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUserMsg(null);
+    try {
+      const token = getCurrentApiToken();
+      const res = await fetch('/api/auth/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: JSON.stringify(newUser),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setUserMsg(data?.error || 'Gagal membuat pengguna.'); return; }
+      setUserMsg('Pengguna berhasil dibuat. Wajib ganti kata sandi saat login pertama.');
+      setNewUser({ username: '', displayName: '', email: '', role: 'petugas_administrasi', password: '' });
+      await loadUsers();
+    } catch { setUserMsg('Gagal menghubungi server.'); }
+  };
+
+  // Handle Change Password (server-side, per-user)
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     setPassMsg(null);
 
-    const oldHash = await hashPassword(currentPass);
-    if (oldHash !== pengaturan.password_hash) {
-      setPassMsg({ type: 'error', text: 'Kata sandi lama tidak sesuai.' });
+    if (newPass.length < 8) {
+      setPassMsg({ type: 'error', text: 'Kata sandi baru minimal 8 karakter.' });
       return;
     }
-
-    if (newPass.length < 5) {
-      setPassMsg({ type: 'error', text: 'Kata sandi baru minimal 5 karakter.' });
-      return;
-    }
-
     if (newPass !== confirmPass) {
       setPassMsg({ type: 'error', text: 'Konfirmasi kata sandi tidak cocok.' });
       return;
     }
 
-    const newHash = await hashPassword(newPass);
-    const ok = await store.updatePengaturan({ password_hash: newHash });
-    store.logAudit('Ganti Password', 'Petugas berhasil memperbarui kata sandi akun bersama');
-    if (ok) {
-      setPassMsg({ type: 'success', text: 'Kata sandi berhasil diperbarui dan disinkronkan ke semua perangkat!' });
+    const res = await changeMyPassword(currentPass, newPass);
+    if (res.success) {
+      setPassMsg({ type: 'success', text: 'Kata sandi berhasil diperbarui.' });
+      setCurrentPass('');
+      setNewPass('');
+      setConfirmPass('');
     } else {
-      setPassMsg({
-        type: 'error',
-        text: 'Kata sandi tersimpan lokal, namun gagal sinkron ke server. Periksa koneksi internet Anda.',
-      });
+      setPassMsg({ type: 'error', text: res.message || 'Gagal mengganti kata sandi.' });
     }
-    setCurrentPass('');
-    setNewPass('');
-    setConfirmPass('');
   };
 
   // Handle Save Sering Berobat
@@ -147,36 +184,49 @@ export default function SettingsModal() {
   const [clearActionMsg, setClearActionMsg] = useState<string | null>(null);
 
   const handleClearAllVisits = async () => {
-    if (confirm('⚠️ PERINGATAN: Apakah Anda yakin ingin MENGHAPUS SEMUA data kunjungan harian? Data WBP akan tetap tersimpan.')) {
-      await store.clearAllKunjungan();
-      setClearActionMsg('Semua catatan kunjungan harian berhasil dibersihkan di server dan semua perangkat.');
+    const phrase = window.prompt('Ketik "HAPUS SEMUA KUNJUNGAN" untuk mengonfirmasi penghapusan seluruh data kunjungan.');
+    if (phrase !== 'HAPUS SEMUA KUNJUNGAN') return;
+    try {
+      await store.clearAllKunjungan(phrase);
+      setClearActionMsg('Semua catatan kunjungan harian berhasil dibersihkan di server.');
+    } catch (e: any) {
+      setClearActionMsg(e?.message || 'Gagal menghapus data kunjungan.');
     }
   };
 
   const handleClearAllWbp = async () => {
-    if (confirm('⚠️ PERINGATAN KERAS: Apakah Anda yakin ingin MENGHAPUS SEMUA data WBP beserta seluruh data kunjungan berobatnya? Tindakan ini tidak dapat dibatalkan.')) {
-      await store.clearAllWbp();
-      setClearActionMsg('Seluruh data WBP dan kunjungan terkait berhasil dihapus di server dan semua perangkat.');
+    const phrase = window.prompt('Ketik "HAPUS SEMUA WBP" untuk mengonfirmasi penghapusan seluruh data WBP dan kunjungan.');
+    if (phrase !== 'HAPUS SEMUA WBP') return;
+    try {
+      await store.clearAllWbp(phrase);
+      setClearActionMsg('Seluruh data WBP dan kunjungan terkait berhasil dihapus di server.');
+    } catch (e: any) {
+      setClearActionMsg(e?.message || 'Gagal menghapus data WBP.');
     }
   };
 
   const handleFactoryReset = async () => {
-    if (confirm('⚠️ PERINGATAN PABRIK: Ini akan mengembalikan sistem ke data awal pabrik (contoh bawaan). Lanjutkan?')) {
-      await store.resetAllData();
-      setClearActionMsg('Sistem berhasil di-reset ke konfigurasi awal di server dan semua perangkat.');
+    const phrase = window.prompt('Ketik "RESET PABRIK" untuk mengonfirmasi reset sistem. (Dinonaktifkan di produksi)');
+    if (phrase !== 'RESET PABRIK') return;
+    try {
+      await store.resetAllData(phrase);
+      setClearActionMsg('Sistem berhasil di-reset ke konfigurasi awal.');
+    } catch (e: any) {
+      setClearActionMsg(e?.message || 'Gagal mereset sistem.');
     }
   };
 
-  const tabs: { id: SettingsSubTab; label: string; icon: any; count?: number }[] = [
+  const tabs: { id: SettingsSubTab; label: string; icon: any; count?: number; adminOnly?: boolean }[] = [
     { id: 'keamanan', label: 'Ganti Kata Sandi', icon: KeyRound },
+    { id: 'pengguna', label: 'Akun Petugas', icon: ShieldAlert, adminOnly: true },
     { id: 'referensi', label: 'Referensi ICD-10', icon: BookOpen },
     { id: 'update_sidb', label: 'Update WBP (SIDB)', icon: RefreshCw },
     { id: 'impor_ekspor', label: 'Impor & Ekspor Cadangan', icon: UploadCloud },
     { id: 'sering_berobat', label: 'Batas Sering Berobat', icon: Clock },
     { id: 'batch', label: 'Daftar Batch BPJS', icon: Palette },
-    { id: 'audit', label: 'Riwayat Audit Log', icon: FileText, count: auditLogs.length },
+    { id: 'audit', label: 'Riwayat Audit Log', icon: FileText, count: auditLogs.length, adminOnly: true },
     { id: 'sampah', label: 'Kotak Sampah', icon: Trash2, count: deletedVisits.length },
-    { id: 'hapus_semua', label: 'Hapus & Bersihkan Data', icon: Trash2 },
+    { id: 'hapus_semua', label: 'Hapus & Bersihkan Data', icon: Trash2, adminOnly: true },
   ];
 
   return (
@@ -234,9 +284,9 @@ export default function SettingsModal() {
           <div className="p-3 rounded-lg bg-teal-50/70 dark:bg-teal-950/30 border border-teal-200 dark:border-teal-900/60 text-xs text-teal-900 dark:text-teal-200 flex items-start gap-2">
             <ShieldAlert className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
             <div>
-              <p className="font-semibold">Keamanan Akun Klinik Bersama</p>
+              <p className="font-semibold">Keamanan Akun Petugas</p>
               <p className="text-[11px] text-teal-700 dark:text-teal-400 mt-0.5">
-                Semua petugas menggunakan akun bersama ini. Ganti kata sandi secara berkala demi menjaga keamanan rekam medis warga binaan.
+                Setiap petugas menggunakan akun pribadi dengan peran masing-masing. Ganti kata sandi Anda secara berkala untuk menjaga keamanan rekam medis.
               </p>
             </div>
           </div>
@@ -278,7 +328,7 @@ export default function SettingsModal() {
                 required
                 value={newPass}
                 onChange={(e) => setNewPass(e.target.value)}
-                placeholder="Minimal 5 karakter"
+                placeholder="Minimal 8 karakter"
                 className="w-full px-3 py-2 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
               />
             </div>
@@ -307,7 +357,42 @@ export default function SettingsModal() {
         </div>
       )}
 
-      {/* SUB-TAB 2: REFERENSI ICD-10 & KAMUS KELUHAN (MOVED HERE) */}
+      {/* SUB-TAB: AKUN PETUGAS (ADMIN) */}
+      {activeTab === 'pengguna' && isAdmin && (
+        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-6 shadow-xs space-y-4">
+          <div>
+            <h3 className="font-bold text-sm text-slate-900 dark:text-white">Akun Petugas & Peran</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Buat akun per petugas. Pengguna baru wajib mengganti kata sandi saat login pertama.</p>
+          </div>
+          {userMsg && <div className="p-2.5 rounded-lg text-xs bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200">{userMsg}</div>}
+          <form onSubmit={handleCreateUser} className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <input required value={newUser.username} onChange={e=>setNewUser({...newUser, username:e.target.value})} placeholder="Username *" className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+            <input value={newUser.displayName} onChange={e=>setNewUser({...newUser, displayName:e.target.value})} placeholder="Nama tampil" className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+            <input type="email" value={newUser.email} onChange={e=>setNewUser({...newUser, email:e.target.value})} placeholder="Email (opsional)" className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+            <select value={newUser.role} onChange={e=>setNewUser({...newUser, role:e.target.value})} className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
+              <option value="admin">Admin</option>
+              <option value="dokter_perawat">Dokter / Perawat</option>
+              <option value="petugas_administrasi">Petugas Administrasi</option>
+            </select>
+            <input required type="password" minLength={8} value={newUser.password} onChange={e=>setNewUser({...newUser, password:e.target.value})} placeholder="Kata sandi awal (min. 8) *" className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 sm:col-span-2" />
+            <button type="submit" className="sm:col-span-2 py-2.5 bg-teal-700 hover:bg-teal-800 text-white font-semibold rounded-lg">Buat Akun Petugas</button>
+          </form>
+          <div className="border-t border-slate-200 dark:border-slate-800 pt-3">
+            <h4 className="text-xs font-semibold mb-2">Daftar pengguna</h4>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-100 dark:bg-slate-800"><tr><th className="py-2 px-3">Username</th><th className="py-2 px-3">Nama</th><th className="py-2 px-3">Peran</th><th className="py-2 px-3">Status</th></tr></thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {usersList.map(u => (
+                    <tr key={u.uid}><td className="py-2 px-3 font-mono">{u.username}</td><td className="py-2 px-3">{u.displayName||'-'}</td><td className="py-2 px-3">{u.role}</td><td className="py-2 px-3">{u.mustChangePassword?'Wajib ganti sandi':(u.isActive!==false?'Aktif':'Nonaktif')}</td></tr>
+                  ))}
+                  {usersList.length===0 && <tr><td colSpan={4} className="py-4 text-center text-slate-400">Belum ada data / tidak dapat memuat.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
       {activeTab === 'referensi' && <ReferencesManager />}
 
       {/* SUB-TAB 3: UPDATE WBP DARI SIDB (MOVED HERE) */}

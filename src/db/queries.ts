@@ -656,6 +656,12 @@ export async function addAuditLog(entry: AuditLogInsert) {
       aksi: entry.aksi,
       rincian: entry.rincian,
       perangkat: entry.perangkat ?? null,
+      userId: (entry as any).userId ?? null,
+      username: (entry as any).username ?? null,
+      role: (entry as any).role ?? null,
+      ipAddress: (entry as any).ipAddress ?? null,
+      target: (entry as any).target ?? null,
+      metadata: (entry as any).metadata ?? null,
       createdAt: entry.createdAt ?? new Date(),
     };
     memoryStore.auditLogs.unshift(row);
@@ -1092,6 +1098,12 @@ export async function restoreAllTables(payload: {
       aksi: a.aksi,
       rincian: a.rincian,
       perangkat: a.perangkat ?? null,
+      userId: (a as any).userId ?? null,
+      username: (a as any).username ?? null,
+      role: (a as any).role ?? null,
+      ipAddress: (a as any).ipAddress ?? null,
+      target: (a as any).target ?? null,
+      metadata: (a as any).metadata ?? null,
       createdAt: a.createdAt ?? new Date(),
     }));
     if (payload.masterObat) {

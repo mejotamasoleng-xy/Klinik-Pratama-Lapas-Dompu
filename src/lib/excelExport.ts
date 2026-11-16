@@ -367,7 +367,7 @@ export function exportComprehensiveBackupToExcel(backupData: {
   const settingsRows = [
     { Kunci: 'batas_sering_berobat_kali', Nilai: safeStr(peng.batas_sering_berobat_kali ?? 7) },
     { Kunci: 'periode_sering_hari', Nilai: safeStr(peng.periode_sering_hari ?? 7) },
-    { Kunci: 'password_hash', Nilai: safeStr(peng.password_hash || '') },
+    // password_hash tidak diekspor (autentikasi per-petugas di server)
     { Kunci: 'nama_klinik', Nilai: safeStr(peng.nama_klinik || 'Klinik Pratama Lapas Kelas IIB Dompu') },
     { Kunci: 'dokter_penanggung_jawab', Nilai: safeStr(peng.dokter_penanggung_jawab || '') },
     { Kunci: 'perawat_pemeriksa', Nilai: safeStr(peng.perawat_pemeriksa || '') },
@@ -607,9 +607,7 @@ export function parseComprehensiveExcelBackup(file: File): Promise<any> {
         if (settingsMap.has('periode_sering_hari')) {
           pengaturan.periode_sering_hari = Number(settingsMap.get('periode_sering_hari')) || 7;
         }
-        if (settingsMap.get('password_hash')) {
-          pengaturan.password_hash = settingsMap.get('password_hash');
-        }
+        // legacy password_hash diabaikan
         if (settingsMap.has('nama_klinik')) {
           pengaturan.nama_klinik = settingsMap.get('nama_klinik');
         }
