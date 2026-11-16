@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { eq, desc, sql } from 'drizzle-orm';
+import { eq, desc, sql, and, gt } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   wbp,
@@ -15,6 +15,7 @@ import {
   sidbHistory,
   masterObat,
   resepObat,
+  idempotencyKeys,
 } from './schema.ts';
 
 type WbpRow = typeof wbp.$inferSelect;
@@ -31,8 +32,8 @@ type SidbHistoryRow = typeof sidbHistory.$inferSelect;
 export type SidbHistoryInsert = typeof sidbHistory.$inferInsert;
 type MasterObatRow = typeof masterObat.$inferSelect;
 export type MasterObatInsert = typeof masterObat.$inferInsert;
-type ResepObatRow = typeof resepObat.$inferSelect;
-export type ResepObatInsert = typeof resepObat.$inferInsert;
+type IdempotencyRow = typeof idempotencyKeys.$inferSelect;
+export type IdempotencyInsert = typeof idempotencyKeys.$inferInsert;
 
 const memoryStore = {
   wbp: [] as WbpRow[],
@@ -44,7 +45,10 @@ const memoryStore = {
   sidbHistory: [] as SidbHistoryRow[],
   masterObat: [] as MasterObatRow[],
   resepObat: [] as ResepObatRow[],
+  idempotency: new Map<string, any>(),
 };
+
+function bumpVersion(v: any) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n + 1 : 2; }
 
 function toWbpRow(r: WbpInsert): WbpRow {
   return {
@@ -55,7 +59,7 @@ function toWbpRow(r: WbpInsert): WbpRow {
     nama: r.nama,
     jenisKelamin: r.jenisKelamin ?? 'Laki-laki',
     tempatLahir: r.tempatLahir ?? null,
-    tanggalLahir: r.tanggalLahir ?? null,
+    tanggalLahir: (r.tanggalLahir as any) ?? null,
     alamat: r.alamat ?? null,
     namaAyah: r.namaAyah ?? null,
     namaIbu: r.namaIbu ?? null,
@@ -63,13 +67,13 @@ function toWbpRow(r: WbpInsert): WbpRow {
     jenisKejahatan: r.jenisKejahatan ?? null,
     kategori: r.kategori ?? 'Narapidana',
     lamaPidana: r.lamaPidana ?? null,
-    tanggalMasuk: r.tanggalMasuk ?? null,
-    tglEkspirasi: r.tglEkspirasi ?? null,
+    tanggalMasuk: (r.tanggalMasuk as any) ?? null,
+    tglEkspirasi: (r.tglEkspirasi as any) ?? null,
     blok: r.blok ?? '',
     kamar: r.kamar ?? '',
     kamarSidb: r.kamarSidb ?? '',
     lokasiSel: r.lokasiSel ?? null,
-    tglSuratPenahanan: r.tglSuratPenahanan ?? null,
+    tglSuratPenahanan: (r.tglSuratPenahanan as any) ?? null,
     nomorSuratPenahanan: r.nomorSuratPenahanan ?? null,
     statusData: r.statusData ?? 'Aktif',
     batchBpjs: r.batchBpjs ?? 'Belum masuk batch',
@@ -81,14 +85,16 @@ function toWbpRow(r: WbpInsert): WbpRow {
     sumberUpdate: r.sumberUpdate ?? null,
     terakhirDiperbarui: r.terakhirDiperbarui ?? null,
     dibuatPada: r.dibuatPada ?? null,
+    version: (r as any).version ?? 1,
+    updatedAt: (r as any).updatedAt ?? new Date(),
     createdAt: r.createdAt ?? new Date(),
-  };
+  } as any;
 }
 
 function toKunjunganRow(r: KunjunganInsert): KunjunganRow {
   return {
     id: r.id,
-    tanggal: r.tanggal,
+    tanggal: r.tanggal as any,
     wbpId: r.wbpId ?? null,
     nama: r.nama,
     nik: r.nik ?? null,
@@ -109,8 +115,10 @@ function toKunjunganRow(r: KunjunganInsert): KunjunganRow {
     dihapus: r.dihapus ?? false,
     dibuatPada: r.dibuatPada ?? new Date().toISOString(),
     diubahPada: r.diubahPada ?? null,
+    version: (r as any).version ?? 1,
+    updatedAt: (r as any).updatedAt ?? new Date(),
     createdAt: r.createdAt ?? new Date(),
-  };
+  } as any;
 }
 
 // Seed helpers
@@ -198,11 +206,20 @@ export async function upsertWbpBatch(records: WbpInsert[]) {
     const updated: WbpRow[] = [];
     for (const r of records) {
       const idx = memoryStore.wbp.findIndex((item) => item.id === r.id);
-      const row = toWbpRow(r);
+      const now = new Date();
       if (idx !== -1) {
-        memoryStore.wbp[idx] = { ...memoryStore.wbp[idx], ...row };
+        const expected = (r as any).version;
+        const curV = Number((memoryStore.wbp[idx] as any).version || 1);
+        if (expected != null && Number(expected) !== curV) {
+          const err: any = new Error('CONFLICT: Data WBP telah diubah di perangkat lain. Muat ulang dan coba lagi.');
+          err.code = 'CONFLICT';
+          throw err;
+        }
+        const row = toWbpRow({ ...(r as any), version: curV + 1, updatedAt: now, createdAt: memoryStore.wbp[idx].createdAt });
+        memoryStore.wbp[idx] = { ...memoryStore.wbp[idx], ...row, dibuatPada: (memoryStore.wbp[idx] as any).dibuatPada || (row as any).dibuatPada } as any;
         updated.push(memoryStore.wbp[idx]);
       } else {
+        const row = toWbpRow({ ...(r as any), version: (r as any).version ?? 1, updatedAt: now });
         memoryStore.wbp.push(row);
         updated.push(row);
       }
@@ -214,9 +231,20 @@ export async function upsertWbpBatch(records: WbpInsert[]) {
     const results: WbpRow[] = [];
     for (let i = 0; i < records.length; i += chunkSize) {
       const chunk = records.slice(i, i + chunkSize);
+      for (const rec of chunk) {
+        const expected = (rec as any).version;
+        if (expected != null) {
+          const existing = await db.select().from(wbp).where(eq(wbp.id, rec.id)).limit(1);
+          if (existing[0] && Number((existing[0] as any).version || 1) !== Number(expected)) {
+            const err: any = new Error('CONFLICT: Data WBP telah diubah di perangkat lain. Muat ulang dan coba lagi.');
+            err.code = 'CONFLICT';
+            throw err;
+          }
+        }
+      }
       const res = await db
         .insert(wbp)
-        .values(chunk)
+        .values(chunk as any)
         .onConflictDoUpdate({
           target: wbp.id,
           set: {
@@ -252,15 +280,17 @@ export async function upsertWbpBatch(records: WbpInsert[]) {
             sumberUpdate: sql`excluded.sumber_update`,
             terakhirDiperbarui: sql`excluded.terakhir_diperbarui`,
             dibuatPada: sql`COALESCE(wbp.dibuat_pada, excluded.dibuat_pada)`,
+            version: sql`COALESCE(wbp.version, 1) + 1`,
+            updatedAt: sql`now()`,
           },
         })
         .returning();
-      results.push(...res);
+      results.push(...(res as any));
     }
     return results;
   } catch (error) {
     console.error('Failed to upsert WBP:', error);
-    throw new Error('Failed to save WBP records.', { cause: error });
+    throw error;
   }
 }
 
@@ -295,14 +325,37 @@ export async function getAllKunjungan() {
 
 export async function insertKunjungan(record: KunjunganInsert) {
   if (!db) {
-    const row = toKunjunganRow(record);
+    const idx = memoryStore.kunjungan.findIndex((k) => k.id === record.id);
+    const now = new Date();
+    if (idx !== -1) {
+      const expected = (record as any).version;
+      const curV = Number((memoryStore.kunjungan[idx] as any).version || 1);
+      if (expected != null && Number(expected) !== curV) {
+        const err: any = new Error('CONFLICT: Data kunjungan telah diubah di perangkat lain. Muat ulang dan coba lagi.');
+        err.code = 'CONFLICT';
+        throw err;
+      }
+      const row = toKunjunganRow({ ...(record as any), version: curV + 1, updatedAt: now, createdAt: memoryStore.kunjungan[idx].createdAt });
+      memoryStore.kunjungan[idx] = { ...memoryStore.kunjungan[idx], ...row } as any;
+      return memoryStore.kunjungan[idx];
+    }
+    const row = toKunjunganRow({ ...(record as any), version: (record as any).version ?? 1, updatedAt: now });
     memoryStore.kunjungan.unshift(row);
     return row;
   }
   try {
+    const expected = (record as any).version;
+    if (expected != null) {
+      const existing = await db.select().from(kunjungan).where(eq(kunjungan.id, record.id)).limit(1);
+      if (existing[0] && Number((existing[0] as any).version || 1) !== Number(expected)) {
+        const err: any = new Error('CONFLICT: Data kunjungan telah diubah di perangkat lain. Muat ulang dan coba lagi.');
+        err.code = 'CONFLICT';
+        throw err;
+      }
+    }
     const result = await db
       .insert(kunjungan)
-      .values(record)
+      .values(record as any)
       .onConflictDoUpdate({
         target: kunjungan.id,
         set: {
@@ -326,13 +379,15 @@ export async function insertKunjungan(record: KunjunganInsert) {
           catatan: sql`excluded.catatan`,
           dihapus: sql`excluded.dihapus`,
           diubahPada: sql`excluded.diubah_pada`,
+          version: sql`COALESCE(kunjungan.version, 1) + 1`,
+          updatedAt: sql`now()`,
         },
       })
       .returning();
     return result[0];
   } catch (error) {
     console.error('Failed to insert Kunjungan:', error);
-    throw new Error('Failed to record visit.', { cause: error });
+    throw error;
   }
 }
 
@@ -340,19 +395,34 @@ export async function updateKunjunganById(id: string, updates: Partial<Kunjungan
   if (!db) {
     const idx = memoryStore.kunjungan.findIndex((k) => k.id === id);
     if (idx === -1) return null;
-    memoryStore.kunjungan[idx] = { ...memoryStore.kunjungan[idx], ...updates };
+    const expected = (updates as any).version;
+    const curV = Number((memoryStore.kunjungan[idx] as any).version || 1);
+    if (expected != null && Number(expected) !== curV) {
+      const err: any = new Error('CONFLICT: Data kunjungan telah diubah di perangkat lain. Muat ulang dan coba lagi.');
+      err.code = 'CONFLICT';
+      throw err;
+    }
+    memoryStore.kunjungan[idx] = { ...memoryStore.kunjungan[idx], ...updates, version: curV + 1, updatedAt: new Date() } as any;
     return memoryStore.kunjungan[idx];
   }
   try {
-    const result = await db
-      .update(kunjungan)
-      .set(updates)
-      .where(eq(kunjungan.id, id))
-      .returning();
+    const expected = (updates as any).version;
+    if (expected != null) {
+      const existing = await db.select().from(kunjungan).where(eq(kunjungan.id, id)).limit(1);
+      if (!existing[0]) return null;
+      if (Number((existing[0] as any).version || 1) !== Number(expected)) {
+        const err: any = new Error('CONFLICT: Data kunjungan telah diubah di perangkat lain. Muat ulang dan coba lagi.');
+        err.code = 'CONFLICT';
+        throw err;
+      }
+      const result = await db.update(kunjungan).set({ ...(updates as any), version: Number((existing[0] as any).version || 1) + 1, updatedAt: new Date() }).where(eq(kunjungan.id, id)).returning();
+      return result[0] || null;
+    }
+    const result = await db.update(kunjungan).set({ ...(updates as any), version: sql`COALESCE(${kunjungan.version},1)+1`, updatedAt: new Date() } as any).where(eq(kunjungan.id, id)).returning();
     return result[0] || null;
   } catch (error) {
     console.error('Failed to update Kunjungan:', error);
-    throw new Error('Failed to update visit.', { cause: error });
+    throw error;
   }
 }
 
@@ -971,8 +1041,33 @@ export async function replaceMasterObatBatch(records: MasterObatInsert[], replac
   }
 }
 
-// Shared multi-instance sync stamp stored in pengaturan_app
-let localSyncVersion = Date.now();
+// Idempotency helpers (Fase 2)
+export async function getIdempotentResponse(key: string): Promise<any | null> {
+  if (!key) return null;
+  if (!db) {
+    return memoryStore.idempotency.get(key) ?? null;
+  }
+  try {
+    const rows = await db.select().from(idempotencyKeys).where(eq(idempotencyKeys.key, key)).limit(1);
+    return rows[0]?.response ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setIdempotentResponse(key: string, scope: string, response: any): Promise<void> {
+  if (!key) return;
+  if (!db) {
+    memoryStore.idempotency.set(key, response);
+    return;
+  }
+  try {
+    await db.insert(idempotencyKeys).values({ key, scope, response, updatedAt: new Date() } as any)
+      .onConflictDoUpdate({ target: idempotencyKeys.key, set: { scope, response, updatedAt: new Date() } as any });
+  } catch {
+    // ignore
+  }
+}
 
 export async function getSharedSyncVersion(): Promise<number> {
   if (!db) {
@@ -1193,4 +1288,56 @@ export async function restoreAllTables(payload: {
     console.error('Failed to restore full backup to DB:', error);
     throw new Error('Failed to restore full backup.', { cause: error });
   }
+}
+
+// Idempotency helpers (Fase 2)
+export async function getIdempotentResponse(key: string): Promise<any | null> {
+  if (!key) return null;
+  if (!db) {
+    return (memoryStore as any).idempotency?.get(key) ?? null;
+  }
+  try {
+    const rows = await db.select().from(idempotencyKeys).where(eq(idempotencyKeys.key, key)).limit(1);
+    return (rows[0] as any)?.response ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setIdempotentResponse(key: string, scope: string, response: any): Promise<void> {
+  if (!key) return;
+  if (!db) {
+    if (!(memoryStore as any).idempotency) (memoryStore as any).idempotency = new Map();
+    (memoryStore as any).idempotency.set(key, response);
+    return;
+  }
+  try {
+    await db.insert(idempotencyKeys).values({ key, scope, response, updatedAt: new Date() } as any)
+      .onConflictDoUpdate({ target: idempotencyKeys.key, set: { scope, response, updatedAt: new Date() } as any });
+  } catch {
+    // ignore
+  }
+}
+
+export async function getWbpCount() {
+  if (!db) return memoryStore.wbp.length;
+  try {
+    const r: any = await db.execute(sql`select count(*)::int as c from wbp`);
+    return Number(r.rows?.[0]?.c ?? r[0]?.c ?? 0);
+  } catch { return memoryStore.wbp.length; }
+}
+export async function getKunjunganCount() {
+  if (!db) return memoryStore.kunjungan.length;
+  try {
+    const r: any = await db.execute(sql`select count(*)::int as c from kunjungan`);
+    return Number(r.rows?.[0]?.c ?? r[0]?.c ?? 0);
+  } catch { return memoryStore.kunjungan.length; }
+}
+export async function getWbpPage(limit: number, offset: number) {
+  if (!db) return memoryStore.wbp.slice(offset, offset + limit);
+  return await db.select().from(wbp).orderBy(desc(wbp.createdAt)).limit(limit).offset(offset);
+}
+export async function getKunjunganPage(limit: number, offset: number) {
+  if (!db) return memoryStore.kunjungan.slice(offset, offset + limit);
+  return await db.select().from(kunjungan).orderBy(desc(kunjungan.createdAt)).limit(limit).offset(offset);
 }

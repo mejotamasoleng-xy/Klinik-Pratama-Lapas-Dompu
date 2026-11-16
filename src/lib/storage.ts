@@ -49,24 +49,25 @@ export async function hashPassword(password: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Date helpers for dd/mm/yyyy
+// Date helpers: storage/UI use dd/mm/yyyy for display; DB uses yyyy-mm-dd.
+// Hack 10/01/2026 -> 1 Oktober removed (migrasi data ditangani di DB).
+
 export function parseDate(str: string): Date | null {
   if (!str) return null;
-  if (str === '10/01/2026' || str === '2026-01-10') {
-    return new Date(2026, 9, 1);
-  }
-  const parts = str.split('/');
+  const s = String(str).trim();
+  if (!s) return null;
+  // dd/mm/yyyy
+  const parts = s.split('/');
   if (parts.length === 3) {
-    let day = parseInt(parts[0], 10);
-    let month = parseInt(parts[1], 10) - 1;
-    let year = parseInt(parts[2], 10);
-    if (year === 2026 && month === 0 && day === 10) {
-      day = 1;
-      month = 9;
+    const day = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const year = parseInt(parts[2], 10);
+    if (!isNaN(day) && !isNaN(month) && !isNaN(year)) {
+      return new Date(year, month, day);
     }
-    return new Date(year, month, day);
   }
-  const iso = new Date(str);
+  // yyyy-mm-dd or ISO
+  const iso = new Date(s);
   return isNaN(iso.getTime()) ? null : iso;
 }
 
@@ -80,16 +81,16 @@ export function formatDateIndo(date: Date): string {
 export function normalizeDateIndo(raw: any): string {
   if (!raw) return '';
   if (raw instanceof Date) {
-    if (raw.getFullYear() === 2026 && raw.getMonth() === 0 && raw.getDate() === 10) {
-      return '01/10/2026';
-    }
+    if (isNaN(raw.getTime())) return '';
     return formatDateIndo(raw);
   }
   const str = String(raw).trim();
   if (!str) return '';
 
-  if (str === '10/01/2026' || str === '2026-01-10' || str.startsWith('2026-01-10T')) {
-    return '01/10/2026';
+  // yyyy-mm-dd or ISO timestamp -> display
+  const isoM = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoM) {
+    return `${isoM[3]}/${isoM[2]}/${isoM[1]}`;
   }
 
   if (str.includes('/')) {
@@ -98,30 +99,8 @@ export function normalizeDateIndo(raw: any): string {
       let day = parseInt(parts[0], 10);
       let month = parseInt(parts[1], 10);
       let year = parseInt(parts[2], 10);
+      if (isNaN(day) || isNaN(month) || isNaN(year)) return str;
       if (year < 100) year += 2000;
-
-      if (year === 2026 && month === 1 && day === 10) {
-        day = 1;
-        month = 10;
-      }
-
-      return `${String(day).padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`;
-    }
-  }
-
-  if (str.includes('-')) {
-    const cleanDate = str.split('T')[0];
-    const parts = cleanDate.split('-');
-    if (parts.length === 3) {
-      let year = parseInt(parts[0], 10);
-      let month = parseInt(parts[1], 10);
-      let day = parseInt(parts[2], 10);
-
-      if (year === 2026 && month === 1 && day === 10) {
-        day = 1;
-        month = 10;
-      }
-
       return `${String(day).padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`;
     }
   }
@@ -132,6 +111,33 @@ export function normalizeDateIndo(raw: any): string {
   }
 
   return str;
+}
+
+export function toDbDate(raw: any): string | null {
+  if (raw == null || raw === '') return null;
+  const str = String(raw).trim();
+  if (!str) return null;
+  const isoM = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoM) return `${isoM[1]}-${isoM[2]}-${isoM[3]}`;
+  if (str.includes('/')) {
+    const parts = str.split('/');
+    if (parts.length === 3) {
+      let day = parseInt(parts[0], 10);
+      let month = parseInt(parts[1], 10);
+      let year = parseInt(parts[2], 10);
+      if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+      if (year < 100) year += 2000;
+      return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+  }
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) {
+    const yy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${yy}-${mm}-${dd}`;
+  }
+  return null;
 }
 
 export const WITA_TIMEZONE = 'Asia/Makassar';

@@ -56,6 +56,12 @@ import {
   restoreAllTables,
   getSharedSyncVersion,
   touchSharedSyncVersion,
+  getIdempotentResponse,
+  setIdempotentResponse,
+  getWbpPage,
+  getKunjunganPage,
+  getWbpCount,
+  getKunjunganCount,
   type WbpInsert,
   type KunjunganInsert,
   type ReferensiInsert,
@@ -79,6 +85,37 @@ import {
   INITIAL_REFERENSI,
   INITIAL_WBP,
 } from './src/data/initialData.ts';
+
+function toIsoDateServer(v: any): string | null {
+  if (v == null || v === '') return null;
+  const str = String(v).trim();
+  if (!str) return null;
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const p = str.split('/');
+  if (p.length === 3) {
+    let d = parseInt(p[0],10), m = parseInt(p[1],10), y = parseInt(p[2],10);
+    if (isNaN(d)||isNaN(m)||isNaN(y)) return null;
+    if (y < 100) y += 2000;
+    return `${String(y).padStart(4,'0')}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  const dt = new Date(str);
+  if (!isNaN(dt.getTime())) {
+    return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+  }
+  return null;
+}
+function toDisplayDateServer(v: any): string {
+  if (v == null || v === '') return '';
+  const str = String(v).trim();
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(str)) return str;
+  const dt = new Date(str);
+  if (!isNaN(dt.getTime())) return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
+  return str;
+}
+
 
 dotenv.config();
 
@@ -218,6 +255,20 @@ const wbpBodySchema = z.object({}).passthrough();
 const kunjunganBodySchema = z.object({}).passthrough();
 const genericArraySchema = z.array(z.any());
 
+async function withIdempotency(req: any, res: any, scope: string, handler: () => Promise<any>) {
+  const key = String(req.headers['idempotency-key'] || '').trim();
+  if (key) {
+    const cached = await getIdempotentResponse(key);
+    if (cached) return res.status(cached._status || 200).json(cached._body ?? cached);
+  }
+  const result = await handler();
+  if (key) {
+    try { await setIdempotentResponse(key, scope, { _status: 200, _body: result }); } catch {}
+  }
+  return res.json(result);
+}
+
+
 
 // ============================================================================
 // REAL-TIME MULTI-DEVICE BROADCAST (SSE + DB-SHARED VERSION)
@@ -282,7 +333,7 @@ function mapWbpFromClient(w: any): WbpInsert {
     nama: String(w.nama || ''),
     jenisKelamin: w.jenis_kelamin ?? w.jenisKelamin ?? 'Laki-laki',
     tempatLahir: w.tempat_lahir ?? w.tempatLahir ?? '',
-    tanggalLahir: w.tanggal_lahir ?? w.tanggalLahir ?? '',
+    tanggalLahir: toIsoDateServer(w.tanggal_lahir ?? w.tanggalLahir),
     alamat: w.alamat ?? '',
     namaAyah: w.nama_ayah ?? w.namaAyah ?? '',
     namaIbu: w.nama_ibu ?? w.namaIbu ?? '',
@@ -290,13 +341,13 @@ function mapWbpFromClient(w: any): WbpInsert {
     jenisKejahatan: w.jenis_kejahatan ?? w.jenisKejahatan ?? '',
     kategori: w.kategori ?? 'Narapidana',
     lamaPidana: w.lama_pidana ?? w.lamaPidana ?? '',
-    tanggalMasuk: w.tanggal_masuk ?? w.tanggalMasuk ?? '',
-    tglEkspirasi: w.tgl_ekspirasi ?? w.tglEkspirasi ?? '',
+    tanggalMasuk: toIsoDateServer(w.tanggal_masuk ?? w.tanggalMasuk),
+    tglEkspirasi: toIsoDateServer(w.tgl_ekspirasi ?? w.tglEkspirasi),
     blok: w.blok ?? '',
     kamar: w.kamar ?? '',
     kamarSidb: w.kamar_sidb ?? w.kamarSidb ?? w.kamar ?? '',
     lokasiSel: w.lokasi_sel ?? w.lokasiSel ?? '',
-    tglSuratPenahanan: w.tgl_surat_penahanan ?? w.tglSuratPenahanan ?? '',
+    tglSuratPenahanan: toIsoDateServer(w.tgl_surat_penahanan ?? w.tglSuratPenahanan),
     nomorSuratPenahanan: w.nomor_surat_penahanan ?? w.nomorSuratPenahanan ?? '',
     statusData: w.status_data ?? w.statusData ?? 'Aktif',
     batchBpjs: w.batch_bpjs ?? w.batchBpjs ?? 'Belum masuk batch',
@@ -308,7 +359,8 @@ function mapWbpFromClient(w: any): WbpInsert {
     sumberUpdate: w.sumber_update ?? w.sumberUpdate ?? '',
     terakhirDiperbarui: w.terakhir_diperbarui ?? w.terakhirDiperbarui ?? '',
     dibuatPada: w.dibuat_pada ?? w.dibuatPada ?? '',
-  };
+    version: w.version != null ? Number(w.version) : undefined,
+  } as any;
 }
 
 function mapWbpToClient(dw: any, idx: number) {
@@ -320,7 +372,7 @@ function mapWbpToClient(dw: any, idx: number) {
     nama: dw.nama,
     jenis_kelamin: dw.jenisKelamin || 'Laki-laki',
     tempat_lahir: dw.tempatLahir || '',
-    tanggal_lahir: dw.tanggalLahir || '',
+    tanggal_lahir: toDisplayDateServer(dw.tanggalLahir),
     alamat: dw.alamat || '',
     nama_ayah: dw.namaAyah || '',
     nama_ibu: dw.namaIbu || '',
@@ -328,13 +380,13 @@ function mapWbpToClient(dw: any, idx: number) {
     jenis_kejahatan: dw.jenisKejahatan || '',
     kategori: dw.kategori || 'Narapidana',
     lama_pidana: dw.lamaPidana || '',
-    tanggal_masuk: dw.tanggalMasuk || '',
-    tgl_ekspirasi: dw.tglEkspirasi || '',
+    tanggal_masuk: toDisplayDateServer(dw.tanggalMasuk),
+    tgl_ekspirasi: toDisplayDateServer(dw.tglEkspirasi),
     blok: dw.blok || '',
     kamar: dw.kamar || '',
     kamar_sidb: dw.kamarSidb || dw.kamar || '',
     lokasi_sel: dw.lokasiSel || '',
-    tgl_surat_penahanan: dw.tglSuratPenahanan || '',
+    tgl_surat_penahanan: toDisplayDateServer(dw.tglSuratPenahanan),
     nomor_surat_penahanan: dw.nomorSuratPenahanan || '',
     status_data: dw.statusData || 'Aktif',
     batch_bpjs: dw.batchBpjs || 'Belum masuk batch',
@@ -346,13 +398,15 @@ function mapWbpToClient(dw: any, idx: number) {
     sumber_update: dw.sumberUpdate || '',
     terakhir_diperbarui: dw.terakhirDiperbarui || '',
     dibuat_pada: dw.dibuatPada || (dw.createdAt ? new Date(dw.createdAt).toISOString() : ''),
+    version: dw.version ?? 1,
+    updated_at: dw.updatedAt ? new Date(dw.updatedAt).toISOString() : undefined,
   };
 }
 
 function mapKunjunganFromClient(k: any): KunjunganInsert {
   return {
     id: String(k.id),
-    tanggal: String(k.tanggal || ''),
+    tanggal: toIsoDateServer(k.tanggal) || String(k.tanggal || ''),
     wbpId: k.wbp_id ?? k.wbpId ?? null,
     nama: String(k.nama || ''),
     nik: k.nik ?? '',
@@ -373,13 +427,14 @@ function mapKunjunganFromClient(k: any): KunjunganInsert {
     dihapus: Boolean(k.dihapus ?? false),
     dibuatPada: k.dibuat_pada ?? k.dibuatPada ?? new Date().toISOString(),
     diubahPada: k.diubah_pada ?? k.diubahPada ?? null,
-  };
+    version: k.version != null ? Number(k.version) : undefined,
+  } as any;
 }
 
 function mapKunjunganToClient(dk: any) {
   return {
     id: dk.id,
-    tanggal: dk.tanggal,
+    tanggal: toDisplayDateServer(dk.tanggal),
     wbp_id: dk.wbpId || '',
     nama: dk.nama,
     nik: dk.nik || '',
@@ -400,6 +455,8 @@ function mapKunjunganToClient(dk: any) {
     dihapus: Boolean(dk.dihapus),
     dibuat_pada: dk.dibuatPada || (dk.createdAt ? new Date(dk.createdAt).toISOString() : new Date().toISOString()),
     diubah_pada: dk.diubahPada || undefined,
+    version: dk.version ?? 1,
+    updated_at: dk.updatedAt ? new Date(dk.updatedAt).toISOString() : undefined,
   };
 }
 
@@ -841,7 +898,10 @@ app.get('/api/backup/export', ...[requireAuth, rejectIfMustChangePassword, requi
       resep_obat: snapshot.resep_obat,
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -912,7 +972,10 @@ app.post('/api/backup/restore', jsonLarge, ...adminDestructive, requireConfirm('
     await broadcastSync('full_restore', clientId);
     res.json({ success: true, version: syncVersion });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -934,7 +997,10 @@ app.post('/api/system/factory-reset', ...adminDestructive, blockInProduction('Fa
     await broadcastSync('factory_reset', clientId);
     res.json({ success: true, version: syncVersion });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -947,7 +1013,10 @@ app.get('/api/wbp', ...authChain, async (req: any, res) => {
     await auditServer(req, 'Baca Data', 'Membaca daftar data WBP', 'wbp');
     res.json(list.map(mapWbpToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -955,11 +1024,17 @@ app.post('/api/wbp', ...writeAdminOrMed, async (req: any, res) => {
   try {
     const body = parseOr400(wbpBodySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const saved = await upsertWbpSingle(mapWbpFromClient(body));
-    await broadcastSync('wbp', clientId);
-    res.json(mapWbpToClient(saved, 0));
+    const saved = await withIdempotency(req, res, 'wbp_upsert', async () => {
+      const s = await upsertWbpSingle(mapWbpFromClient(body));
+      await broadcastSync('wbp', clientId);
+      return mapWbpToClient(s, 0);
+    });
+    if (res.headersSent) return;
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -971,7 +1046,10 @@ app.put('/api/wbp/:id', ...writeAdminOrMed, async (req: any, res) => {
     await broadcastSync('wbp', clientId);
     res.json(mapWbpToClient(saved, 0));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -983,7 +1061,10 @@ app.delete('/api/wbp/all', ...adminDestructive, requireConfirm('HAPUS SEMUA WBP'
     await broadcastSync('wbp', clientId);
     res.json({ message: 'All WBP deleted', count: result.length });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -994,7 +1075,10 @@ app.delete('/api/wbp/:id', ...writeAdminOrMed, async (req: any, res) => {
     await broadcastSync('wbp', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1007,7 +1091,10 @@ app.post('/api/wbp/batch', ...writeAdminOrMed, async (req: any, res) => {
     await broadcastSync('wbp', clientId);
     res.json(result.map(mapWbpToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1020,7 +1107,10 @@ app.get('/api/kunjungan', ...authChain, async (req: any, res) => {
     await auditServer(req, 'Baca Data', 'Membaca daftar rekam medis/kunjungan', 'kunjungan');
     res.json(list.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1034,7 +1124,10 @@ app.post('/api/kunjungan', ...writeMedical, async (req: any, res) => {
     await broadcastSync('kunjungan', clientId);
     res.json(mapKunjunganToClient(result));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1051,7 +1144,10 @@ app.put('/api/kunjungan/:id', ...writeMedical, async (req: any, res) => {
     await broadcastSync('kunjungan', clientId);
     res.json(result ? mapKunjunganToClient(result) : null);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1070,7 +1166,10 @@ app.post('/api/kunjungan/batch', ...writeMedical, async (req: any, res) => {
     await broadcastSync('kunjungan', clientId);
     res.json(result.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1082,7 +1181,10 @@ app.delete('/api/kunjungan/all', ...adminDestructive, requireConfirm('HAPUS SEMU
     await broadcastSync('kunjungan', clientId);
     res.json({ message: 'All visits deleted', count: result.length });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1093,7 +1195,10 @@ app.patch('/api/kunjungan/:id/restore', ...writeMedical, async (req: any, res) =
     await broadcastSync('kunjungan', clientId);
     res.json(result.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1105,7 +1210,10 @@ app.delete('/api/kunjungan/:id/permanent', ...adminDestructive, async (req: any,
     await broadcastSync('kunjungan', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1117,7 +1225,10 @@ app.delete('/api/kunjungan/:id', ...writeMedical, async (req: any, res) => {
     await broadcastSync('kunjungan', clientId);
     res.json(result.map(mapKunjunganToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1129,7 +1240,10 @@ app.get('/api/penyakit', ...authChain, async (_req: any, res) => {
     const list = await getAllPenyakit();
     res.json(list.map(mapPenyakitToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1140,7 +1254,10 @@ app.post('/api/penyakit', ...[requireAuth, rejectIfMustChangePassword, requireRo
     await broadcastSync('penyakit', clientId);
     res.json(mapPenyakitToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1154,7 +1271,10 @@ app.put('/api/penyakit/:id', ...[requireAuth, rejectIfMustChangePassword, requir
     await broadcastSync('penyakit', clientId);
     res.json(mapPenyakitToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1168,7 +1288,10 @@ app.post('/api/penyakit/batch', ...[requireAuth, rejectIfMustChangePassword, req
     await broadcastSync('penyakit', clientId);
     res.json(saved.map(mapPenyakitToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1177,7 +1300,10 @@ app.get('/api/referensi', ...authChain, async (_req: any, res) => {
     const list = await getAllReferensi();
     res.json(list.map(mapReferensiToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1191,7 +1317,10 @@ app.post('/api/referensi/batch', ...[requireAuth, rejectIfMustChangePassword, re
     await broadcastSync('referensi', clientId);
     res.json(saved.map(mapReferensiToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1202,7 +1331,10 @@ app.post('/api/referensi', ...[requireAuth, rejectIfMustChangePassword, requireR
     await broadcastSync('referensi', clientId);
     res.json(mapReferensiToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1213,7 +1345,10 @@ app.put('/api/referensi/:id', ...[requireAuth, rejectIfMustChangePassword, requi
     await broadcastSync('referensi', clientId);
     res.json(mapReferensiToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1224,7 +1359,10 @@ app.delete('/api/referensi/:id', ...[requireAuth, rejectIfMustChangePassword, re
     await broadcastSync('referensi', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1236,7 +1374,10 @@ app.get('/api/pengaturan/:key', ...authChain, async (req: any, res) => {
     const value = await getSetting(req.params.key);
     res.json(value);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1251,7 +1392,10 @@ app.post('/api/pengaturan/:key', ...[requireAuth, rejectIfMustChangePassword, re
     await broadcastSync('pengaturan', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1260,7 +1404,10 @@ app.get('/api/sidb-history', ...authChain, async (_req: any, res) => {
     const list = await getSidbHistoryList();
     res.json(list.map(mapSidbToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1271,7 +1418,10 @@ app.post('/api/sidb-history', ...[requireAuth, rejectIfMustChangePassword, requi
     await broadcastSync('sidb_history', clientId);
     res.json(saved ? mapSidbToClient(saved) : null);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1280,7 +1430,10 @@ app.get('/api/audit', ...[requireAuth, rejectIfMustChangePassword, requireRoles(
     const list = await getAuditLogs(500);
     res.json(list.map(mapAuditToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1305,7 +1458,10 @@ app.post('/api/audit', ...authChain, async (req: any, res) => {
     await broadcastSync('audit', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1317,7 +1473,10 @@ app.get('/api/obat', ...authChain, async (_req: any, res) => {
     const list = await getAllMasterObat();
     res.json(list.map(mapMasterObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1331,7 +1490,10 @@ app.post('/api/obat/batch', ...[requireAuth, rejectIfMustChangePassword, require
     await broadcastSync('obat', clientId);
     res.json(saved.map(mapMasterObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1342,7 +1504,10 @@ app.post('/api/obat', ...[requireAuth, rejectIfMustChangePassword, requireRoles(
     await broadcastSync('obat', clientId);
     res.json(mapMasterObatToClient(saved));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1353,7 +1518,10 @@ app.delete('/api/obat/:id', ...[requireAuth, rejectIfMustChangePassword, require
     await broadcastSync('obat', clientId);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1362,7 +1530,10 @@ app.get('/api/resep', ...authChain, async (_req: any, res) => {
     const list = await getAllResepObat();
     res.json(list.map(mapResepObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
@@ -1376,7 +1547,10 @@ app.put('/api/resep/kunjungan/:kunjunganId', ...[requireAuth, rejectIfMustChange
     await broadcastSync('resep', clientId);
     res.json(saved.map(mapResepObatToClient));
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
+      return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
+    }
+    res.status(500).json({ error: error?.message || 'Terjadi kesalahan server.' });
   }
 });
 
