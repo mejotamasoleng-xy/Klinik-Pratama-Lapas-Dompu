@@ -13,6 +13,7 @@ export interface AuthState {
   username: string;
   loginTime: number;
   rememberMe: boolean;
+  apiToken?: string;
 }
 
 export interface LockoutState {
@@ -29,6 +30,10 @@ export function getLockoutState(): LockoutState {
   } catch {
     return { count: 0, lockedUntil: 0 };
   }
+}
+
+export function createApiSessionTokenFromPasswordHash(passwordHash: string): string {
+  return passwordHash.trim();
 }
 
 export function recordFailedAttempt(): { count: number; lockedUntil: number; isLocked: boolean } {
@@ -106,11 +111,13 @@ export async function loginWithCredentials(
 
   // Success
   resetFailedAttempts();
+  const apiToken = createApiSessionTokenFromPasswordHash(inputHash);
   const session: AuthState = {
     isAuthenticated: true,
     username: cleanUser,
     loginTime: now,
     rememberMe,
+    apiToken,
   };
 
   const storageToUse = rememberMe ? localStorage : sessionStorage;
@@ -142,8 +149,14 @@ export function getCurrentSession(): AuthState | null {
   }
 }
 
+export function getCurrentApiToken(): string | null {
+  const session = getCurrentSession();
+  return session?.apiToken ?? null;
+}
+
 export function logoutSession() {
   localStorage.removeItem(SESSION_STORAGE_KEY);
   sessionStorage.removeItem(SESSION_STORAGE_KEY);
   store.logAudit('Logout', 'Petugas keluar dari sistem klinik');
 }
+
