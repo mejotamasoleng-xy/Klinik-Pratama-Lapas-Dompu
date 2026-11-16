@@ -1024,13 +1024,13 @@ app.post('/api/wbp', ...writeAdminOrMed, async (req: any, res) => {
   try {
     const body = parseOr400(wbpBodySchema, req, res); if (!body) return;
     const clientId = req.headers['x-client-id'] as string | undefined;
-    const saved = await withIdempotency(req, res, 'wbp_upsert', async () => {
+    await withIdempotency(req, res, 'wbp_upsert', async () => {
       const s = await upsertWbpSingle(mapWbpFromClient(body));
       await broadcastSync('wbp', clientId);
       return mapWbpToClient(s, 0);
     });
-    if (res.headersSent) return;
   } catch (error: any) {
+    if (res.headersSent) return;
     if (error?.code === 'CONFLICT' || String(error?.message || '').startsWith('CONFLICT')) {
       return res.status(409).json({ error: error.message || 'Data telah diubah di perangkat lain. Muat ulang dan coba lagi.', code: 'CONFLICT' });
     }

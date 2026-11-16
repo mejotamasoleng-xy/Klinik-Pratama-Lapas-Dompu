@@ -32,6 +32,8 @@ type SidbHistoryRow = typeof sidbHistory.$inferSelect;
 export type SidbHistoryInsert = typeof sidbHistory.$inferInsert;
 type MasterObatRow = typeof masterObat.$inferSelect;
 export type MasterObatInsert = typeof masterObat.$inferInsert;
+type ResepObatRow = typeof resepObat.$inferSelect;
+export type ResepObatInsert = typeof resepObat.$inferInsert;
 type IdempotencyRow = typeof idempotencyKeys.$inferSelect;
 export type IdempotencyInsert = typeof idempotencyKeys.$inferInsert;
 
@@ -1041,33 +1043,7 @@ export async function replaceMasterObatBatch(records: MasterObatInsert[], replac
   }
 }
 
-// Idempotency helpers (Fase 2)
-export async function getIdempotentResponse(key: string): Promise<any | null> {
-  if (!key) return null;
-  if (!db) {
-    return memoryStore.idempotency.get(key) ?? null;
-  }
-  try {
-    const rows = await db.select().from(idempotencyKeys).where(eq(idempotencyKeys.key, key)).limit(1);
-    return rows[0]?.response ?? null;
-  } catch {
-    return null;
-  }
-}
-
-export async function setIdempotentResponse(key: string, scope: string, response: any): Promise<void> {
-  if (!key) return;
-  if (!db) {
-    memoryStore.idempotency.set(key, response);
-    return;
-  }
-  try {
-    await db.insert(idempotencyKeys).values({ key, scope, response, updatedAt: new Date() } as any)
-      .onConflictDoUpdate({ target: idempotencyKeys.key, set: { scope, response, updatedAt: new Date() } as any });
-  } catch {
-    // ignore
-  }
-}
+// (idempotency helpers defined below)
 
 export async function getSharedSyncVersion(): Promise<number> {
   if (!db) {
